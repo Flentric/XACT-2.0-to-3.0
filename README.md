@@ -6,7 +6,7 @@ Requires Python 3.8+. Converting Xbox 360 banks for PC also uses [vgmstream](htt
 
 ## Usage
 
-**Windows (drag and drop):** keep the `.bat` files in the same folder as `xwb2to3.py`. Drag one or more `.xwb` files onto `convert.bat`. Converted banks keep their file name and bank name, and are saved in a `converted` folder next to the originals. You need [Python 3](https://www.python.org/downloads/) installed.
+**Windows (drag and drop):** keep the `.bat` files in the same folder as `xwb2to3.py`. Drag `.xwb` files, or whole folders of them, onto `convert.bat`. Converted banks keep their file name and bank name, and are saved in a `converted` folder next to the originals. You need [Python 3](https://www.python.org/downloads/) installed.
 
 **Dead Island and other Techland games:** drag your banks onto `convert_techland.bat` instead. Techland's engine expects its own XACT3 variant: content version `65536` instead of `46`, with sounds packed back to back.
 
@@ -19,9 +19,13 @@ Requires Python 3.8+. Converting Xbox 360 banks for PC also uses [vgmstream](htt
 
 For the XMA step, download the vgmstream **Command-line (64-bit)** build for Windows. Put `vgmstream-cli.exe` and its DLLs next to `xwb2to3.py`, or in a `vgmstream` subfolder.
 
+The ADPCM encoder runs roughly 65× faster than real time per CPU core. Add `--best` to try every ADPCM predictor on each block; it's about 1.5× slower and only marginally better.
+
 ADPCM compression needs numpy. Install it once with `py -m pip install numpy`. Without it, the audio stays as uncompressed PCM, which plays but is about 4× bigger. Pass `--pcm` to keep PCM on purpose.
 
 **Other games with a non-standard format:** drag any `.xwb` from the game onto `convert.bat` together with your banks. The converter spots that the game's file is already XACT3 and copies only its format: the version numbers and how the data is packed. Your banks keep their own names, streaming type and sounds.
+
+**Mass conversion:** drop a folder and every `.xwb` inside it, subfolders included, is converted. The results go into `<folder>\converted\`, keeping the same subfolder layout. Banks that are already XACT3 are skipped. The work is spread over all CPU cores: several banks are converted at once, and each track is decoded and compressed in parallel. Use `-j N` to limit the number of cores.
 
 **Command line:**
 
@@ -29,6 +33,7 @@ ADPCM compression needs numpy. Install it once with `py -m pip install numpy`. W
 python3 xwb2to3.py "Wave Bank.xwb"                 # writes "converted/Wave Bank.xwb"
 python3 xwb2to3.py in.xwb -o out.xwb
 python3 xwb2to3.py banks/*.xwb -o converted/        # batch into a directory
+python3 xwb2to3.py sr1_audio/ --techland           # a whole folder, recursively
 python3 xwb2to3.py in.xwb --techland               # Dead Island / Techland format (PC)
 python3 xwb2to3.py x360.xwb --pc                    # Xbox 360 bank -> standard PC XACT3
 python3 xwb2to3.py in.xwb --like game_bank.xwb     # use the format of a game's own bank

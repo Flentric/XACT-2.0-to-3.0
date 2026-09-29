@@ -1,8 +1,10 @@
 @echo off
 setlocal
-rem Drag one or more XACT2 .xwb files onto this file to convert them to XACT 3.
+rem Drag XACT2 .xwb files and/or whole folders onto this file to convert them
+rem to XACT 3. Folders are searched (including subfolders) for .xwb files.
 rem Converted banks keep their file name and go in a "converted" folder next
-rem to the originals.
+rem to the originals (inside the dropped folder, mirroring its subfolders).
+rem All CPU cores are used.
 rem
 rem Targeting a specific game? Also drag any .xwb from that game onto this file
 rem (together with yours) and the output will use the game's XACT3 format.
@@ -30,7 +32,7 @@ pause
 exit /b
 
 :usage
-echo Drag one or more .xwb files onto this .bat file to convert them to XACT 3.
+echo Drag .xwb files or folders onto this .bat file to convert them to XACT 3.
 echo.
 pause
 exit /b 1
