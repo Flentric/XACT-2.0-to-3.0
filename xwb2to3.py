@@ -170,6 +170,12 @@ class Reference:
                    packed=packed, count=count, names=names, tags=tags)
 
 
+# Dead Island, Dead Island Riptide, Call of Juarez, Nail'd, ... (Chrome engine)
+TECHLAND = Reference(signature=b"", tool_version=0x10000, header_version=XACT3_HEADER_VERSION,
+                     bank_name=b"", streaming=False, alignment=0, packed=True, count=0,
+                     names=[], tags=set())
+
+
 def is_xact3(version):
     return 42 <= version <= 46 or version == 0x10000
 
@@ -196,7 +202,8 @@ def align_up(value, alignment):
 
 def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None):
     """Convert an XACT2 bank. `like` (a Reference) copies the target game's
-    version numbers, bank name, streaming type, alignment and packing."""
+    format: version numbers and whether entries are packed back to back.
+    The bank's own name, streaming type and entries are kept."""
     if data[:4] == b"WBND":
         e = "<"
     elif data[:4] == b"DNBW":
@@ -261,23 +268,10 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
     header_version = XACT3_HEADER_VERSION
     packed = False
     if like is not None:
-        if like.signature != data[:4]:
+        if like.signature and like.signature != data[:4]:
             raise ConvertError("reference bank and source bank use different byte orders")
         tool_version, header_version = like.tool_version, like.header_version
         packed = like.packed and not compact
-        if bank_name != like.bank_name:
-            log(f"bank name '{bank_name.decode('latin-1')}' -> "
-                f"'{like.bank_name.decode('latin-1')}' (from reference)")
-            bank_name = like.bank_name
-        if streaming != like.streaming:
-            log(f"bank type -> {'streaming' if like.streaming else 'in-memory'} (from reference)")
-            streaming = like.streaming
-            flags = (flags & ~TYPE_STREAMING) | (TYPE_STREAMING if streaming else 0)
-        if not compact:
-            alignment = like.alignment
-        if count != like.count:
-            log(f"warning: source has {count} entries but the reference has {like.count}; "
-                "the game's sound bank refers to waves by index")
 
     min_align = DVD_SECTOR_SIZE if streaming else 4
     wave_data = r.blob(*wave)
@@ -390,15 +384,17 @@ def main(argv=None):
                     "already an XACT3 bank (e.g. the game's original), it is used as --like.")
     ap.add_argument("input", nargs="+", help="XACT2 .xwb file(s)")
     ap.add_argument("-o", "--output",
-                    help="output file (single input) or directory (multiple inputs); "
-                         "default: <name>.xact3.xwb next to the input, or "
-                         "converted/<reference name> when a reference bank is used")
+                    help="output file (single input) or directory; default: a 'converted' "
+                         "folder next to each input, keeping the file name")
     ap.add_argument("--like", metavar="GAME_BANK.xwb",
-                    help="XACT3 bank from the target game; copies its version numbers, bank "
-                         "name, streaming type, alignment and data packing")
+                    help="any XACT3 bank from the target game; copies its format (version "
+                         "numbers and data packing). Your bank keeps its own name and settings")
+    ap.add_argument("--techland", action="store_true",
+                    help="write the format used by Techland games such as Dead Island "
+                         "(same as --like with one of their banks)")
     ap.add_argument("--tool-version", type=int, default=XACT3_TOOL_VERSION,
                     help=f"XACT3 content version to write (default {XACT3_TOOL_VERSION}, "
-                         "what XNA 4.0 expects; ignored with --like)")
+                         "what XNA 4.0 expects; ignored with --like/--techland)")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -421,7 +417,7 @@ def main(argv=None):
         if refs and len(inputs) > 1:
             like_path = refs[0]
             inputs.remove(like_path)
-    like = None
+    like = TECHLAND if args.techland else None
     if like_path:
         try:
             with open(like_path, "rb") as f:
@@ -429,24 +425,19 @@ def main(argv=None):
         except (ConvertError, OSError) as exc:
             print(f"{like_path}: error: {exc}", file=sys.stderr)
             return 1
-        log(f"reference: {like_path} (content version {like.tool_version}, bank "
-            f"'{like.bank_name.decode('latin-1')}', "
-            f"{'streaming' if like.streaming else 'in-memory'}, "
-            f"{'packed' if like.packed else 'aligned'} data)")
+    if like:
+        log(f"target format: content version {like.tool_version}, "
+            f"{'packed' if like.packed else 'aligned'} data"
+            + (f" (from {like_path})" if like_path else " (Techland preset)"))
 
     failures = 0
     for path in inputs:
         if args.output and len(inputs) == 1 and not os.path.isdir(args.output):
             out = args.output
-        elif like and len(inputs) == 1:
-            # named like the game's file so it can be dropped straight in
+        else:
             out_dir = args.output or os.path.join(os.path.dirname(path), "converted")
             os.makedirs(out_dir, exist_ok=True)
-            out = os.path.join(out_dir, os.path.basename(like_path))
-        else:
-            root, ext = os.path.splitext(os.path.basename(path))
-            out_dir = args.output or os.path.dirname(path)
-            out = os.path.join(out_dir, f"{root}.xact3{ext or '.xwb'}")
+            out = os.path.join(out_dir, os.path.basename(path))
         if os.path.exists(out) and any(os.path.samefile(out, p)
                                        for p in [path] + ([like_path] if like_path else [])):
             print(f"{path}: error: refusing to overwrite {out}", file=sys.stderr)

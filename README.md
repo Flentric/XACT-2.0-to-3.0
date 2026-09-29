@@ -6,24 +6,20 @@ Requires only Python 3.8+. There are no other dependencies.
 
 ## Usage
 
-**Windows (drag and drop):** keep `convert.bat` in the same folder as `xwb2to3.py`. Drag one or more `.xwb` files onto `convert.bat`. Each converted bank is saved next to the original as `<name>.xact3.xwb`. You need [Python 3](https://www.python.org/downloads/) installed.
+**Windows (drag and drop):** keep the `.bat` files in the same folder as `xwb2to3.py`. Drag one or more `.xwb` files onto `convert.bat`. Converted banks keep their file name and bank name, and are saved in a `converted` folder next to the originals. You need [Python 3](https://www.python.org/downloads/) installed.
 
-**Replacing a game's bank:** drag your XACT2 bank *and* the game's original `.xwb` onto `convert.bat` at the same time. The converter spots that the game's file is already XACT3 and treats it as a reference. From it, it copies:
+**Dead Island and other Techland games:** drag your banks onto `convert_techland.bat` instead. Techland's engine expects its own XACT3 variant: content version `65536` instead of `46`, with sounds packed back to back.
 
-- **Version numbers:** some games use non-standard values. Dead Island and other Techland games use `65536`.
-- **Bank name:** the game's sound bank looks wave banks up by this name.
-- **Streaming type:** whether the bank is streamed or loaded into memory.
-- **Alignment and packing:** where each sound sits in the file.
-
-The result is written to a `converted` folder under the game's file name, ready to copy into the game. Your bank should have the same number of sounds, in the same order, as the one it replaces, because the game plays waves by index.
+**Other games with a non-standard format:** drag any `.xwb` from the game onto `convert.bat` together with your banks. The converter spots that the game's file is already XACT3 and copies only its format: the version numbers and how the data is packed. Your banks keep their own names, streaming type and sounds.
 
 **Command line:**
 
 ```sh
-python3 xwb2to3.py "Wave Bank.xwb"                 # writes "Wave Bank.xact3.xwb"
+python3 xwb2to3.py "Wave Bank.xwb"                 # writes "converted/Wave Bank.xwb"
 python3 xwb2to3.py in.xwb -o out.xwb
 python3 xwb2to3.py banks/*.xwb -o converted/        # batch into a directory
-python3 xwb2to3.py in.xwb --like game_bank.xwb     # match a game's own XACT3 bank
+python3 xwb2to3.py in.xwb --techland               # Dead Island / Techland format
+python3 xwb2to3.py in.xwb --like game_bank.xwb     # use the format of a game's own bank
 python3 xwb2to3.py in.xwb --tool-version 45         # write a different XACT3 content version
 ```
 
