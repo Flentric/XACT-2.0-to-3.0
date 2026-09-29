@@ -123,6 +123,57 @@ class MiniFormat:
         raise ConvertError(f"cannot compute sample positions for {TAG_NAMES[self.tag]}")
 
 
+@dataclass
+class Reference:
+    """Container settings copied from an existing XACT3 bank of the target game."""
+    signature: bytes
+    tool_version: int
+    header_version: int
+    bank_name: bytes
+    streaming: bool
+    alignment: int
+    packed: bool      # entries stored back to back instead of on alignment boundaries
+    count: int
+    names: list
+    tags: set
+
+    @classmethod
+    def parse(cls, data):
+        e = "<" if data[:4] == b"WBND" else ">"
+        if data[:4] not in (b"WBND", b"DNBW"):
+            raise ConvertError("reference is not an XACT wave bank")
+        r = Reader(data, e)
+        tool_version, header_version = r.u32(4), r.u32(8)
+        if not is_xact3(tool_version):
+            raise ConvertError(f"reference is not an XACT3 bank (content version {tool_version})")
+        segs = [(r.u32(12 + i * 8), r.u32(16 + i * 8)) for i in range(5)]
+        bo = segs[0][0]
+        flags, count = r.u32(bo), r.u32(bo + 4)
+        meta_elem, name_elem, alignment = r.u32(bo + 72), r.u32(bo + 76), r.u32(bo + 80)
+        packed = False
+        tags = set()
+        if not flags & FLAGS_COMPACT and meta_elem >= ENTRY_SIZE:
+            for i in range(count):
+                eo = segs[1][0] + i * meta_elem
+                tags.add(r.u32(eo + 4) & 0x3)
+                if alignment and r.u32(eo + 8) % alignment:
+                    packed = True
+        names = []
+        if segs[3][1] and name_elem:
+            blob = r.blob(*segs[3])
+            names = [blob[i:i + name_elem].split(b"\0", 1)[0]
+                     for i in range(0, len(blob), name_elem)]
+        return cls(signature=data[:4], tool_version=tool_version,
+                   header_version=header_version,
+                   bank_name=r.blob(bo + 8, 64).split(b"\0", 1)[0],
+                   streaming=bool(flags & TYPE_STREAMING), alignment=alignment,
+                   packed=packed, count=count, names=names, tags=tags)
+
+
+def is_xact3(version):
+    return 42 <= version <= 46 or version == 0x10000
+
+
 class Reader:
     def __init__(self, data, endian):
         self.data = data
@@ -143,7 +194,9 @@ def align_up(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
+def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None):
+    """Convert an XACT2 bank. `like` (a Reference) copies the target game's
+    version numbers, bank name, streaming type, alignment and packing."""
     if data[:4] == b"WBND":
         e = "<"
     elif data[:4] == b"DNBW":
@@ -154,7 +207,7 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
     version = r.u32(4)
 
     if version > XACT2_4_MAX and version != 0x87:
-        if 42 <= version <= 46 or version == 0x10000:
+        if is_xact3(version):
             raise ConvertError(f"bank is already XACT3 (content version {version})")
         raise ConvertError(f"unknown content version {version}")
     if version == 0x87:
@@ -205,6 +258,27 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
         f"{'streaming' if streaming else 'in-memory'}{', compact' if compact else ''}, "
         f"alignment {alignment}")
 
+    header_version = XACT3_HEADER_VERSION
+    packed = False
+    if like is not None:
+        if like.signature != data[:4]:
+            raise ConvertError("reference bank and source bank use different byte orders")
+        tool_version, header_version = like.tool_version, like.header_version
+        packed = like.packed and not compact
+        if bank_name != like.bank_name:
+            log(f"bank name '{bank_name.decode('latin-1')}' -> "
+                f"'{like.bank_name.decode('latin-1')}' (from reference)")
+            bank_name = like.bank_name
+        if streaming != like.streaming:
+            log(f"bank type -> {'streaming' if like.streaming else 'in-memory'} (from reference)")
+            streaming = like.streaming
+            flags = (flags & ~TYPE_STREAMING) | (TYPE_STREAMING if streaming else 0)
+        if not compact:
+            alignment = like.alignment
+        if count != like.count:
+            log(f"warning: source has {count} entries but the reference has {like.count}; "
+                "the game's sound bank refers to waves by index")
+
     min_align = DVD_SECTOR_SIZE if streaming else 4
     wave_data = r.blob(*wave)
     meta = r.blob(meta_off, meta_len)
@@ -227,6 +301,7 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
         out_align = max(alignment, min_align)
         if streaming and out_align % DVD_SECTOR_SIZE:
             out_align = align_up(out_align, DVD_SECTOR_SIZE)
+        entry_align = 1 if packed else out_align
         new_meta = bytearray()
         new_wave = bytearray()
         for i in range(count):
@@ -250,7 +325,10 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
             if duration > 0x0FFFFFFF:
                 raise ConvertError(f"entry {i}: duration too long for XACT3")
 
-            new_off = align_up(len(new_wave), out_align)
+            if like is not None and like.tags and fmt.tag not in like.tags:
+                log(f"warning: entry {i} is {TAG_NAMES[fmt.tag]} but the reference uses "
+                    + "/".join(TAG_NAMES[t] for t in sorted(like.tags)))
+            new_off = align_up(len(new_wave), entry_align)
             new_wave += b"\0" * (new_off - len(new_wave))
             new_wave += wave_data[play_off:play_off + play_len]
             new_meta += struct.pack(e + "6I", entry_flags | duration << 4, fmt.pack(),
@@ -282,45 +360,101 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None):
     body = bytearray()
     segments = []
     pos = HEADER_SIZE
-    for idx, (blob, seg_align) in enumerate(((bankdata, 4), (new_meta, 4), (seek_data, 4),
-                                             (names_data, 4), (new_wave, out_align))):
+    wave_align = 4 if packed else out_align
+    for blob, seg_align in ((bankdata, 4), (new_meta, 4), (seek_data, 4),
+                            (names_data, 4), (new_wave, wave_align)):
         start = align_up(pos, seg_align)
         body += b"\0" * (start - pos)
         body += blob
-        # empty optional segments are (0, 0); wave data always gets an offset
-        segments.append((start if blob or idx == 4 else 0, len(blob)))
+        # like the XACT tool, empty segments still point at the current position
+        segments.append((start, len(blob)))
         pos = start + len(blob)
 
-    header = (data[:4] + struct.pack(e + "2I", tool_version, XACT3_HEADER_VERSION)
+    header = (data[:4] + struct.pack(e + "2I", tool_version, header_version)
               + b"".join(struct.pack(e + "2I", o, n) for o, n in segments))
     assert len(header) == HEADER_SIZE
     return bytes(header + body)
 
 
+def read_version(path):
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if len(head) < 8 or head[:4] not in (b"WBND", b"DNBW"):
+        return None
+    return struct.unpack(("<" if head[:4] == b"WBND" else ">") + "I", head[4:])[0]
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Convert XACT 2.x .xwb wave banks to XACT 3.")
+    ap = argparse.ArgumentParser(
+        description="Convert XACT 2.x .xwb wave banks to XACT 3. If one of the inputs is "
+                    "already an XACT3 bank (e.g. the game's original), it is used as --like.")
     ap.add_argument("input", nargs="+", help="XACT2 .xwb file(s)")
     ap.add_argument("-o", "--output",
                     help="output file (single input) or directory (multiple inputs); "
-                         "default: <name>.xact3.xwb next to the input")
+                         "default: <name>.xact3.xwb next to the input, or "
+                         "converted/<reference name> when a reference bank is used")
+    ap.add_argument("--like", metavar="GAME_BANK.xwb",
+                    help="XACT3 bank from the target game; copies its version numbers, bank "
+                         "name, streaming type, alignment and data packing")
     ap.add_argument("--tool-version", type=int, default=XACT3_TOOL_VERSION,
                     help=f"XACT3 content version to write (default {XACT3_TOOL_VERSION}, "
-                         "what XNA 4.0 expects)")
+                         "what XNA 4.0 expects; ignored with --like)")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     log = (lambda m: None) if args.quiet else (lambda m: print(m, file=sys.stderr))
+    inputs = list(args.input)
+    like_path = args.like
+    if like_path is None:
+        refs = []
+        for path in inputs:
+            try:
+                version = read_version(path)
+            except OSError:
+                continue
+            if version is not None and is_xact3(version):
+                refs.append(path)
+        if len(refs) > 1:
+            print("error: more than one XACT3 bank given; only one reference bank is allowed",
+                  file=sys.stderr)
+            return 1
+        if refs and len(inputs) > 1:
+            like_path = refs[0]
+            inputs.remove(like_path)
+    like = None
+    if like_path:
+        try:
+            with open(like_path, "rb") as f:
+                like = Reference.parse(f.read())
+        except (ConvertError, OSError) as exc:
+            print(f"{like_path}: error: {exc}", file=sys.stderr)
+            return 1
+        log(f"reference: {like_path} (content version {like.tool_version}, bank "
+            f"'{like.bank_name.decode('latin-1')}', "
+            f"{'streaming' if like.streaming else 'in-memory'}, "
+            f"{'packed' if like.packed else 'aligned'} data)")
+
     failures = 0
-    for path in args.input:
-        if args.output and len(args.input) == 1 and not os.path.isdir(args.output):
+    for path in inputs:
+        if args.output and len(inputs) == 1 and not os.path.isdir(args.output):
             out = args.output
+        elif like and len(inputs) == 1:
+            # named like the game's file so it can be dropped straight in
+            out_dir = args.output or os.path.join(os.path.dirname(path), "converted")
+            os.makedirs(out_dir, exist_ok=True)
+            out = os.path.join(out_dir, os.path.basename(like_path))
         else:
             root, ext = os.path.splitext(os.path.basename(path))
             out_dir = args.output or os.path.dirname(path)
             out = os.path.join(out_dir, f"{root}.xact3{ext or '.xwb'}")
+        if os.path.exists(out) and any(os.path.samefile(out, p)
+                                       for p in [path] + ([like_path] if like_path else [])):
+            print(f"{path}: error: refusing to overwrite {out}", file=sys.stderr)
+            failures += 1
+            continue
         try:
             with open(path, "rb") as f:
-                result = convert(f.read(), args.tool_version, log)
+                result = convert(f.read(), args.tool_version, log, like)
             with open(out, "wb") as f:
                 f.write(result)
             log(f"{path} -> {out}")
