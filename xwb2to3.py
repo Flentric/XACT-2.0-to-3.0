@@ -12,16 +12,23 @@ container is rewritten:
   * missing durations are computed from the play region
 
 Supported codecs: PCM (8/16-bit), MS-ADPCM, and XMA2 (content 39-41, copied as
-is). XMA1 (Xbox 360 banks up to content version 38) cannot be converted
-without re-encoding and is rejected.
+is). For PC targets (--pc, --techland or a PC reference bank), Xbox 360 banks
+are rewritten little-endian: 16-bit PCM is byte-swapped, and XMA1/XMA2 audio,
+which PCs cannot play, is decoded to 16-bit PCM with vgmstream-cli.
 
 Layout details follow vgmstream's xwb.c and DirectXTK's WaveBankReader.cpp.
 """
 
 import argparse
+import array
+import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import wave
 from dataclasses import dataclass
 
 # Content (tool) version boundaries, as classified by vgmstream.
@@ -86,12 +93,12 @@ class MiniFormat:
                 | (self.block_align & 0xFF) << 23
                 | (self.bits & 0x1) << 31)
 
-    def normalized(self, version):
+    def normalized(self, version, decoding=False):
         """Return the format as XACT3 expects it for this source version."""
         if self.channels == 0:
             raise ConvertError("entry has 0 channels")
         tag = self.tag
-        if tag == TAG_XMA and version <= XACT2_3_MAX:
+        if tag == TAG_XMA and version <= XACT2_3_MAX and not decoding:
             raise ConvertError("XMA1 audio (Xbox 360, content version <= 38) cannot be "
                                "converted without re-encoding")
         if tag == TAG_WMA or (version <= XACT2_2_MAX and tag not in (TAG_PCM, TAG_XMA)):
@@ -171,7 +178,7 @@ class Reference:
 
 
 # Dead Island, Dead Island Riptide, Call of Juarez, Nail'd, ... (Chrome engine)
-TECHLAND = Reference(signature=b"", tool_version=0x10000, header_version=XACT3_HEADER_VERSION,
+TECHLAND = Reference(signature=b"WBND", tool_version=0x10000, header_version=XACT3_HEADER_VERSION,
                      bank_name=b"", streaming=False, alignment=0, packed=True, count=0,
                      names=[], tags=set())
 
@@ -196,14 +203,83 @@ class Reader:
         return self.data[off:off + size]
 
 
+def find_vgmstream():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("vgmstream-cli.exe", "vgmstream-cli", "test.exe"):
+        for folder in (here, os.path.join(here, "vgmstream")):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return path
+    return shutil.which("vgmstream-cli")
+
+
+class VgmstreamDecoder:
+    """Decodes entries of the source bank to PCM16 with vgmstream-cli."""
+
+    def __init__(self, exe=None):
+        self.exe = exe or find_vgmstream()
+        self.tmp = None
+
+    def __call__(self, data, index):
+        if not self.exe:
+            raise ConvertError(
+                "this bank contains Xbox 360 XMA audio, which must be decoded for PC. "
+                "Download vgmstream-cli (https://vgmstream.org, 'command line' build) and "
+                "put vgmstream-cli.exe and its DLLs next to xwb2to3.py")
+        if self.tmp is None:
+            self.tmp = tempfile.TemporaryDirectory()
+            with open(os.path.join(self.tmp.name, "bank.xwb"), "wb") as f:
+                f.write(data)
+        src = os.path.join(self.tmp.name, "bank.xwb")
+        out = os.path.join(self.tmp.name, "entry.wav")
+        proc = subprocess.run([self.exe, "-i", "-I", "-s", str(index + 1), "-o", out, src],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(out):
+            raise ConvertError(f"vgmstream could not decode entry {index}: "
+                               f"{(proc.stderr or proc.stdout).strip()[:300]}")
+        info = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("{"):
+                info = json.loads(line)
+        with wave.open(out, "rb") as w:
+            channels, rate = w.getnchannels(), w.getframerate()
+            pcm = w.readframes(w.getnframes())
+        os.remove(out)
+        loop = info.get("loopingInfo") or None
+        return channels, rate, pcm, (loop["start"], loop["end"]) if loop else None
+
+    def close(self):
+        if self.tmp is not None:
+            self.tmp.cleanup()
+            self.tmp = None
+
+
+def swap32_all(blob):
+    words = array.array("I")
+    words.frombytes(blob[:len(blob) // 4 * 4])
+    words.byteswap()
+    return words.tobytes()
+
+
+def swap16(pcm):
+    samples = array.array("h")
+    samples.frombytes(pcm[:len(pcm) // 2 * 2])
+    samples.byteswap()
+    return samples.tobytes()
+
+
 def align_up(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None):
+def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None,
+            pc=False, decoder=None, vgmstream=None):
     """Convert an XACT2 bank. `like` (a Reference) copies the target game's
-    format: version numbers and whether entries are packed back to back.
-    The bank's own name, streaming type and entries are kept."""
+    format: version numbers, byte order and whether entries are packed back
+    to back. The bank's own name, streaming type and entries are kept.
+    `pc` forces a little-endian bank with PC-playable audio; `decoder` turns
+    an entry into PCM16 (defaults to vgmstream-cli at `vgmstream` or found
+    automatically)."""
     if data[:4] == b"WBND":
         e = "<"
     elif data[:4] == b"DNBW":
@@ -268,10 +344,15 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
     header_version = XACT3_HEADER_VERSION
     packed = False
     if like is not None:
-        if like.signature and like.signature != data[:4]:
-            raise ConvertError("reference bank and source bank use different byte orders")
         tool_version, header_version = like.tool_version, like.header_version
         packed = like.packed and not compact
+        pc = pc or like.signature == b"WBND"
+    out_e = "<" if pc else e
+    swap = out_e != e
+    if swap:
+        log("converting Xbox 360 (big-endian) bank to PC (little-endian)")
+        if compact:
+            raise ConvertError("compact Xbox 360 banks cannot be converted for PC yet")
 
     min_align = DVD_SECTOR_SIZE if streaming else 4
     wave_data = r.blob(*wave)
@@ -298,40 +379,66 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
         entry_align = 1 if packed else out_align
         new_meta = bytearray()
         new_wave = bytearray()
-        for i in range(count):
-            eo = meta_off + i * meta_elem
-            flags_dur = r.u32(eo)
-            fmt = MiniFormat.unpack(r.u32(eo + 4), version).normalized(version)
-            play_off, play_len = r.u32(eo + 8), r.u32(eo + 12)
-            loop_a, loop_b = r.u32(eo + 16), r.u32(eo + 20)
-            if play_off + play_len > len(wave_data):
-                raise ConvertError(f"entry {i}: play region outside wave data")
+        decoded_any = False
+        own_decoder = decoder is None
+        if own_decoder:
+            decoder = VgmstreamDecoder(vgmstream)
+        try:
+            for i in range(count):
+                eo = meta_off + i * meta_elem
+                flags_dur = r.u32(eo)
+                raw_fmt = MiniFormat.unpack(r.u32(eo + 4), version)
+                # PCs cannot play XMA; the ADPCM variant never shipped big-endian
+                decode = raw_fmt.tag != TAG_PCM and (swap or pc and raw_fmt.tag == TAG_XMA)
+                fmt = raw_fmt.normalized(version, decoding=decode)
+                play_off, play_len = r.u32(eo + 8), r.u32(eo + 12)
+                loop_a, loop_b = r.u32(eo + 16), r.u32(eo + 20)
+                if play_off + play_len > len(wave_data):
+                    raise ConvertError(f"entry {i}: play region outside wave data")
+                entry_flags = flags_dur & 0xF
+                duration = flags_dur >> 4
 
-            entry_flags = flags_dur & 0xF
-            duration = flags_dur >> 4
-            if fmt.tag == TAG_PCM or (fmt.tag == TAG_ADPCM and duration == 0):
-                duration = fmt.bytes_to_samples(play_len)
-            if version <= XACT2_3_MAX and (loop_a or loop_b):
-                # (byte offset, byte length) -> (start sample, sample count)
-                start = fmt.bytes_to_samples(loop_a)
-                end = fmt.bytes_to_samples(loop_a + loop_b)
-                loop_a, loop_b = start, end - start
-            if duration > 0x0FFFFFFF:
-                raise ConvertError(f"entry {i}: duration too long for XACT3")
+                if decode:
+                    channels, rate, audio, loop = decoder(data, i)
+                    fmt = MiniFormat(TAG_PCM, channels, rate, channels * 2, 1)
+                    duration = fmt.bytes_to_samples(len(audio))
+                    loop_a, loop_b = (loop[0], loop[1] - loop[0]) if loop else (0, 0)
+                    decoded_any = True
+                else:
+                    audio = wave_data[play_off:play_off + play_len]
+                    if fmt.tag == TAG_PCM or (fmt.tag == TAG_ADPCM and duration == 0):
+                        duration = fmt.bytes_to_samples(play_len)
+                    if version <= XACT2_3_MAX and (loop_a or loop_b):
+                        # (byte offset, byte length) -> (start sample, sample count)
+                        start = fmt.bytes_to_samples(loop_a)
+                        end = fmt.bytes_to_samples(loop_a + loop_b)
+                        loop_a, loop_b = start, end - start
+                    if swap and fmt.tag == TAG_PCM and fmt.bits:
+                        audio = swap16(audio)
+                if duration > 0x0FFFFFFF:
+                    raise ConvertError(f"entry {i}: duration too long for XACT3")
 
-            if like is not None and like.tags and fmt.tag not in like.tags:
-                log(f"warning: entry {i} is {TAG_NAMES[fmt.tag]} but the reference uses "
-                    + "/".join(TAG_NAMES[t] for t in sorted(like.tags)))
-            new_off = align_up(len(new_wave), entry_align)
-            new_wave += b"\0" * (new_off - len(new_wave))
-            new_wave += wave_data[play_off:play_off + play_len]
-            new_meta += struct.pack(e + "6I", entry_flags | duration << 4, fmt.pack(),
-                                    new_off, play_len, loop_a, loop_b)
-            log(f"  #{i}: {TAG_NAMES[fmt.tag]} {fmt.channels}ch {fmt.rate}Hz, "
-                f"{duration} samples" + (f", loop {loop_a}+{loop_b}" if loop_b else ""))
+                if like is not None and like.tags and fmt.tag not in like.tags:
+                    log(f"warning: entry {i} is {TAG_NAMES[fmt.tag]} but the reference uses "
+                        + "/".join(TAG_NAMES[t] for t in sorted(like.tags)))
+                new_off = align_up(len(new_wave), entry_align)
+                new_wave += b"\0" * (new_off - len(new_wave))
+                new_wave += audio
+                new_meta += struct.pack(out_e + "6I", entry_flags | duration << 4, fmt.pack(),
+                                        new_off, len(audio), loop_a, loop_b)
+                log(f"  #{i}: {TAG_NAMES[fmt.tag]} {fmt.channels}ch {fmt.rate}Hz, "
+                    f"{duration} samples" + (f", loop {loop_a}+{loop_b}" if loop_b else "")
+                    + (" (decoded to PCM)" if decode else ""))
+        finally:
+            if own_decoder:
+                decoder.close()
         meta_elem = ENTRY_SIZE
 
     seek_data = r.blob(*seek)
+    if not compact and decoded_any:
+        seek_data = b""  # XMA seek tables; the decoded audio is PCM
+    elif swap and seek_data:
+        seek_data = swap32_all(seek_data)
     if seek_data:
         flags |= FLAGS_SEEKTABLES
     else:
@@ -347,8 +454,9 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
         name_elem = 0
 
     # ---- assemble ----
-    bankdata = struct.pack(e + "2I64s4I", flags, count, bank_name[:63], meta_elem,
-                           name_elem, out_align, compact_fmt_raw) + build_time
+    bankdata = (struct.pack(out_e + "2I64s4I", flags, count, bank_name[:63], meta_elem,
+                            name_elem, out_align, compact_fmt_raw)
+                + struct.pack(out_e + "2I", *struct.unpack(e + "2I", build_time)))
     assert len(bankdata) == BANKDATA_SIZE
 
     body = bytearray()
@@ -364,8 +472,9 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
         segments.append((start, len(blob)))
         pos = start + len(blob)
 
-    header = (data[:4] + struct.pack(e + "2I", tool_version, header_version)
-              + b"".join(struct.pack(e + "2I", o, n) for o, n in segments))
+    signature = b"WBND" if out_e == "<" else b"DNBW"
+    header = (signature + struct.pack(out_e + "2I", tool_version, header_version)
+              + b"".join(struct.pack(out_e + "2I", o, n) for o, n in segments))
     assert len(header) == HEADER_SIZE
     return bytes(header + body)
 
@@ -392,6 +501,12 @@ def main(argv=None):
     ap.add_argument("--techland", action="store_true",
                     help="write the format used by Techland games such as Dead Island "
                          "(same as --like with one of their banks)")
+    ap.add_argument("--pc", action="store_true",
+                    help="make the bank playable on PC: little-endian, XMA decoded to PCM "
+                         "(implied by --techland and by a PC --like bank)")
+    ap.add_argument("--vgmstream", metavar="PATH",
+                    help="vgmstream-cli executable used to decode XMA (default: next to this "
+                         "script or on PATH)")
     ap.add_argument("--tool-version", type=int, default=XACT3_TOOL_VERSION,
                     help=f"XACT3 content version to write (default {XACT3_TOOL_VERSION}, "
                          "what XNA 4.0 expects; ignored with --like/--techland)")
@@ -445,7 +560,8 @@ def main(argv=None):
             continue
         try:
             with open(path, "rb") as f:
-                result = convert(f.read(), args.tool_version, log, like)
+                result = convert(f.read(), args.tool_version, log, like, pc=args.pc,
+                                 vgmstream=args.vgmstream)
             with open(out, "wb") as f:
                 f.write(result)
             log(f"{path} -> {out}")
