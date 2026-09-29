@@ -71,7 +71,7 @@ def build_xact2(version, entries, names=None, flags=0, alignment=4, e="<",
     return header + bytes(body)
 
 
-def parse_xact3(data):
+def parse_xact3(data, packed=False):
     """Independent XACT3 parser mirroring DirectXTK's WaveBankReader checks."""
     e = "<" if data[:4] == b"WBND" else ">"
     assert data[:4] in (b"WBND", b"DNBW")
@@ -107,7 +107,7 @@ def parse_xact3(data):
             entries.append(struct.unpack_from(e + "I", data, o)[0])
             continue
         fd, fmt, po, pl, ls, lt = struct.unpack_from(e + "6I", data, o)
-        assert po % alignment == 0 and po + pl <= wl
+        assert (packed or po % alignment == 0) and po + pl <= wl
         entries.append(dict(flags=fd & 0xF, duration=fd >> 4,
                             fmt=x.MiniFormat.unpack(fmt, 46),
                             audio=wave[po:po + pl], loop=(ls, lt)))
@@ -206,6 +206,77 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(out["wave"], wave)
         cf = x.MiniFormat.unpack(out["cfmt"], 46)
         self.assertEqual((cf.rate, cf.channels, cf.bits), (22050, 1, 1))
+
+    def _reference(self, streaming=True, packed=True):
+        """A Techland-style XACT3 reference bank (content version 0x10000)."""
+        fmt = old_fmt(x.TAG_ADPCM, 1, 48000, 48, 0, 46)
+        audio = b"\x03" * 70
+        meta = struct.pack("<6I", 128 << 4, fmt, 0, 70, 0, 0) + \
+            struct.pack("<6I", 128 << 4, fmt, 70 if packed else 2048, 70, 0, 0)
+        bank = struct.pack("<2I", x.FLAGS_ENTRYNAMES | (1 if streaming else 0), 2) + \
+            b"game_bank".ljust(64, b"\0") + struct.pack("<4I", 24, 64, 2048, 0) + b"\0" * 8
+        names = b"a".ljust(64, b"\0") + b"b".ljust(64, b"\0")
+        wave = audio + audio if packed else audio.ljust(2048, b"\0") + audio
+        off = 52
+        segs = []
+        body = b""
+        for blob in (bank, meta, b"", names, wave):
+            segs.append((off, len(blob)))
+            body += blob
+            off += len(blob)
+        return (b"WBND" + struct.pack("<2I", 0x10000, 44)
+                + b"".join(struct.pack("<2I", *sg) for sg in segs) + body)
+
+    def test_like_reference_copies_format_only(self):
+        like = x.Reference.parse(self._reference())
+        self.assertEqual((like.tool_version, like.bank_name, like.streaming, like.packed),
+                         (0x10000, b"game_bank", True, True))
+        ch, align_field = 1, 48
+        audio = b"\x01" * 70 * 3
+        fmt = old_fmt(x.TAG_ADPCM, ch, 48000, align_field, 0, 37)
+        src = build_xact2(37, [(0, fmt, audio, 0, 0), (0, fmt, audio[:70], 0, 0)],
+                          names=[b"a", b"b"], alignment=4)
+        out_bytes = x.convert(src, like=like)
+        self.assertEqual(struct.unpack_from("<2I", out_bytes, 4), (0x10000, 44))
+        e = "<"
+        segs = [struct.unpack_from(e + "2I", out_bytes, 12 + 8 * i) for i in range(5)]
+        bo = segs[0][0]
+        flags = struct.unpack_from(e + "I", out_bytes, bo)[0]
+        # the bank keeps its own identity: name, in-memory type, alignment
+        self.assertFalse(flags & x.TYPE_STREAMING)
+        self.assertEqual(out_bytes[bo + 8:bo + 17], b"TestBank\0")
+        self.assertEqual(struct.unpack_from(e + "I", out_bytes, bo + 80)[0], 4)
+        # packed: second entry directly follows the first
+        po2 = struct.unpack_from(e + "I", out_bytes, segs[1][0] + 24 + 8)[0]
+        self.assertEqual(po2, len(audio))
+        self.assertEqual(segs[2], (segs[1][0] + segs[1][1], 0))
+
+    def test_like_aligned_reference_keeps_alignment(self):
+        like = x.Reference.parse(self._reference(packed=False))
+        self.assertFalse(like.packed)
+        fmt = old_fmt(x.TAG_PCM, 1, 48000, 0, 1, 37)
+        src = build_xact2(37, [(0, fmt, b"\0\1" * 10, 0, 0), (0, fmt, b"\0\1" * 10, 0, 0)])
+        out = parse_xact3(x.convert(src, like=like))
+        self.assertEqual(out["version"], 0x10000)
+        self.assertEqual(out["alignment"], 4)
+        self.assertEqual(out["entries"][1]["audio"], b"\0\1" * 10)
+
+    def test_cli_techland_preset_keeps_file_name(self):
+        import os
+        import tempfile
+        fmt = old_fmt(x.TAG_PCM, 1, 48000, 0, 1, 37)
+        src = build_xact2(37, [(0, fmt, b"\0\1" * 3, 0, 0), (0, fmt, b"\2\3" * 3, 0, 0)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "my_bank.xwb")
+            with open(path, "wb") as f:
+                f.write(src)
+            self.assertEqual(x.main(["-q", "--techland", path]), 0)
+            with open(os.path.join(tmp, "converted", "my_bank.xwb"), "rb") as f:
+                out_bytes = f.read()
+        out = parse_xact3(out_bytes, packed=True)
+        self.assertEqual(out["version"], 0x10000)
+        self.assertEqual(out["name"], b"TestBank")
+        self.assertEqual([en["audio"] for en in out["entries"]], [b"\0\1" * 3, b"\2\3" * 3])
 
     def test_rejects_xma1_and_xact3(self):
         fmt = old_fmt(x.TAG_XMA, 2, 44100, 0, 0, 37)
