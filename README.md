@@ -6,6 +6,10 @@ Requires only Python 3.8+. There are no other dependencies.
 
 ## Usage
 
+**Windows (drag and drop):** keep `convert.bat` in the same folder as `xwb2to3.py`. Drag one or more `.xwb` files onto `convert.bat`. Each converted bank is saved next to the original as `<name>.xact3.xwb`. You need [Python 3](https://www.python.org/downloads/) installed.
+
+**Command line:**
+
 ```sh
 python3 xwb2to3.py "Wave Bank.xwb"                 # writes "Wave Bank.xact3.xwb"
 python3 xwb2to3.py in.xwb -o out.xwb
