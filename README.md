@@ -27,6 +27,13 @@ ADPCM compression needs numpy. Install it once with `py -m pip install numpy`. W
 
 **Mass conversion:** drop a folder and every `.xwb` inside it, subfolders included, is converted. The results go into `<folder>\converted\`, keeping the same subfolder layout. Banks that are already XACT3 are skipped. The work is spread over all CPU cores: several banks are converted at once, and each track is decoded and compressed in parallel. Use `-j N` to limit the number of cores.
 
+**Removing DJ talk and ads (`remove_ads.bat`):** drag already-converted banks, or folders of them, onto `remove_ads.bat`. It asks:
+
+1. The minimum song length in seconds. The default is 90.
+2. Whether to also drop tracks with a clearly lower sample rate than the bank's songs, meaning more than 2% lower. Small differences such as 47999 vs 48000 Hz are ignored.
+
+It then lists every track with its length, sample rate, name, and whether it will be kept. Nothing is written until you confirm. Trimmed banks go into a `songs_only` folder, and everything else about each bank stays the same. Removing tracks shifts the positions of the tracks after them. From the command line: `python3 filter_xwb.py banks/ --min-seconds 90 [--top-rate] [--dry-run]`.
+
 **Command line:**
 
 ```sh
@@ -65,7 +72,7 @@ It supports XACT2 content versions 4–41, in little-endian (PC) and big-endian 
 ## Tests
 
 ```sh
-python3 -m unittest -v test_xwb2to3
+python3 -m unittest -v test_xwb2to3 test_filter_xwb
 VGMSTREAM=/path/to/vgmstream-cli python3 -m unittest -v test_xwb2to3   # also test real decoding
 ```
 

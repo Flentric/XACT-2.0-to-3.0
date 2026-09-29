@@ -655,21 +655,21 @@ def read_version(path):
     return struct.unpack(("<" if head[:4] == b"WBND" else ">") + "I", head[4:])[0]
 
 
-def expand_inputs(paths):
+def expand_inputs(paths, out_name="converted", skip_dirs=("converted", "songs_only")):
     """Yield (file, output_dir) pairs. Folders are searched recursively for .xwb
-    files, whose output mirrors the folder layout under <folder>/converted."""
+    files, whose output mirrors the folder layout under <folder>/<out_name>."""
     for path in paths:
         if not os.path.isdir(path):
-            yield path, os.path.join(os.path.dirname(path), "converted")
+            yield path, os.path.join(os.path.dirname(path), out_name)
             continue
         root = os.path.abspath(path)
         for folder, dirs, files in os.walk(root):
-            dirs[:] = sorted(d for d in dirs if d.lower() != "converted")
+            dirs[:] = sorted(d for d in dirs if d.lower() not in skip_dirs)
             for name in sorted(files):
                 if name.lower().endswith(".xwb"):
                     rel = os.path.relpath(folder, root)
                     yield (os.path.join(folder, name),
-                           os.path.normpath(os.path.join(root, "converted", rel)))
+                           os.path.normpath(os.path.join(root, out_name, rel)))
 
 
 def main(argv=None):
