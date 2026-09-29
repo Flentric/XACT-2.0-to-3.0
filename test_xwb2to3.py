@@ -429,8 +429,11 @@ class ConvertTests(unittest.TestCase):
                 conv = os.path.join(tmp, "radio", "converted")
                 self.assertEqual(sorted(os.listdir(conv)), ["a.xwb", "sub"])
                 self.assertEqual(os.listdir(os.path.join(conv, "sub")), ["b.xwb"])
-                outputs.append([open(os.path.join(conv, r), "rb").read()
-                                for r in ("a.xwb", "sub/b.xwb")])
+                run = []
+                for r in ("a.xwb", "sub/b.xwb"):
+                    with open(os.path.join(conv, r), "rb") as fh:
+                        run.append(fh.read())
+                outputs.append(run)
                 os.rename(conv, os.path.join(tmp, f"run{jobs}"))
             self.assertEqual(outputs[0], outputs[1])
             out = parse_xact3(outputs[0][1], packed=True)
