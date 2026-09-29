@@ -213,28 +213,23 @@ def find_vgmstream():
     return shutil.which("vgmstream-cli")
 
 
-class VgmstreamDecoder:
-    """Decodes entries of the source bank to PCM16 with vgmstream-cli."""
+MISSING_VGMSTREAM = (
+    "this bank contains Xbox 360 XMA audio, which must be decoded for PC. "
+    "Download vgmstream-cli (https://vgmstream.org, 'Command-line (64-bit)' build) and "
+    "put vgmstream-cli.exe and its DLLs next to xwb2to3.py")
 
-    def __init__(self, exe=None):
-        self.exe = exe or find_vgmstream()
-        self.tmp = None
 
-    def __call__(self, data, index):
-        if not self.exe:
-            raise ConvertError(
-                "this bank contains Xbox 360 XMA audio, which must be decoded for PC. "
-                "Download vgmstream-cli (https://vgmstream.org, 'command line' build) and "
-                "put vgmstream-cli.exe and its DLLs next to xwb2to3.py")
-        if self.tmp is None:
-            self.tmp = tempfile.TemporaryDirectory()
-            with open(os.path.join(self.tmp.name, "bank.xwb"), "wb") as f:
-                f.write(data)
-        src = os.path.join(self.tmp.name, "bank.xwb")
-        out = os.path.join(self.tmp.name, "entry.wav")
-        proc = subprocess.run([self.exe, "-i", "-I", "-s", str(index + 1), "-o", out, src],
+def vgmstream_decode(exe, src, index):
+    """Decode entry `index` of the bank file `src` to PCM16 with vgmstream-cli.
+    Returns (channels, rate, pcm_bytes, (loop_start, loop_end) or None)."""
+    if not exe:
+        raise ConvertError(MISSING_VGMSTREAM)
+    fd, out = tempfile.mkstemp(suffix=".wav", dir=os.path.dirname(src))
+    os.close(fd)
+    try:
+        proc = subprocess.run([exe, "-i", "-I", "-s", str(index + 1), "-o", out, src],
                               capture_output=True, text=True)
-        if proc.returncode != 0 or not os.path.exists(out):
+        if proc.returncode != 0 or not os.path.getsize(out):
             raise ConvertError(f"vgmstream could not decode entry {index}: "
                                f"{(proc.stderr or proc.stdout).strip()[:300]}")
         info = {}
@@ -244,9 +239,33 @@ class VgmstreamDecoder:
         with wave.open(out, "rb") as w:
             channels, rate = w.getnchannels(), w.getframerate()
             pcm = w.readframes(w.getnframes())
+    finally:
         os.remove(out)
-        loop = info.get("loopingInfo") or None
-        return channels, rate, pcm, (loop["start"], loop["end"]) if loop else None
+    loop = info.get("loopingInfo") or None
+    return channels, rate, pcm, (loop["start"], loop["end"]) if loop else None
+
+
+class VgmstreamDecoder:
+    """Decodes entries of a bank held in memory with vgmstream-cli."""
+
+    def __init__(self, exe=None):
+        self.exe = exe or find_vgmstream()
+        self.tmp = None
+        self.src = None
+
+    def bank_path(self, data):
+        """Write the bank to a temporary file once and return its path."""
+        if self.tmp is None:
+            self.tmp = tempfile.TemporaryDirectory()
+            self.src = os.path.join(self.tmp.name, "bank.xwb")
+            with open(self.src, "wb") as f:
+                f.write(data)
+        return self.src
+
+    def __call__(self, data, index):
+        if not self.exe:
+            raise ConvertError(MISSING_VGMSTREAM)
+        return vgmstream_decode(self.exe, self.bank_path(data), index)
 
     def close(self):
         if self.tmp is not None:
@@ -260,12 +279,14 @@ ADPCM_ALIGN_FIELD = 48  # 70 bytes per channel = 128 samples per block, as XACT 
 ADPCM_SAMPLES_PER_BLOCK = (ADPCM_ALIGN_FIELD + ADPCM_BLOCKALIGN_CONVERSION_OFFSET) * 2 - 12
 
 
-def encode_msadpcm(pcm, channels, align_field=ADPCM_ALIGN_FIELD, chunk_blocks=8192):
+def encode_msadpcm(pcm, channels, align_field=ADPCM_ALIGN_FIELD, chunk_blocks=2048,
+                   best=False):
     """Encode 16-bit little-endian PCM to MS-ADPCM as XACT stores it.
 
-    Blocks are independent, so all blocks (and all 7 predictors, keeping the
-    best per block and channel) are encoded in parallel with numpy.
-    Returns (adpcm_bytes, padded_sample_count)."""
+    Blocks are independent, so all blocks are encoded in parallel with numpy.
+    Each block uses the predictor that best fits its samples; with best=True
+    all 7 predictors are fully encoded and the one with least error is kept
+    (about 5x slower, marginally better). Returns (adpcm_bytes, sample_count)."""
     import numpy as np
 
     ch = channels
@@ -273,53 +294,91 @@ def encode_msadpcm(pcm, channels, align_field=ADPCM_ALIGN_FIELD, chunk_blocks=81
     spb = block_bytes * 2 // ch - 12
     samples = np.frombuffer(pcm[:len(pcm) // (2 * ch) * 2 * ch], dtype="<i2").reshape(-1, ch)
     nblocks = max(1, -(-len(samples) // spb))
-    padded = np.zeros((nblocks * spb, ch), dtype=np.int32)
+    padded = np.zeros((nblocks * spb, ch), dtype=np.int64)
     padded[:len(samples)] = samples
     blocks = padded.reshape(nblocks, spb, ch)
 
-    c1 = np.array([c[0] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
-    c2 = np.array([c[1] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
+    coef1 = np.array([c[0] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
+    coef2 = np.array([c[1] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
     adapt = np.array(ADPCM_ADAPT, dtype=np.int64)
     out = bytearray()
     for b0 in range(0, nblocks, chunk_blocks):
-        x = blocks[b0:b0 + chunk_blocks].transpose(1, 0, 2).astype(np.int64)  # (spb, B, ch)
-        s2 = np.broadcast_to(x[0], (7,) + x[0].shape).copy()
-        s1 = np.broadcast_to(x[1], (7,) + x[1].shape).copy()
+        x = blocks[b0:b0 + chunk_blocks].transpose(1, 0, 2)  # (spb, B, ch)
+        nb_, nch = x.shape[1], x.shape[2]
+        bidx = np.arange(nb_)[:, None]
+        cidx = np.arange(nch)[None, :]
+        if best:
+            cand = np.broadcast_to(np.arange(7)[:, None, None], (7, nb_, nch))
+        else:
+            # open-loop fit: squared prediction error of each predictor on the real samples
+            fit = np.stack([(((x[2:] - ((x[1:-1] * k1 + x[:-2] * k2) >> 8)) ** 2).sum(axis=0))
+                            for k1, k2 in ADPCM_COEFS])  # (7, B, ch)
+            cand = np.argmin(fit, axis=0)[None]           # (1, B, ch)
+        c1, c2 = coef1[cand, 0, 0], coef2[cand, 0, 0]
+        s2 = np.broadcast_to(x[0], cand.shape).copy()
+        s1 = np.broadcast_to(x[1], cand.shape).copy()
         # initial step size from the prediction error of the first few samples
-        err0 = np.zeros_like(s1)
-        p2, p1 = s2.copy(), s1.copy()
-        for t in range(2, min(spb, 6)):
-            pred = (p1 * c1 + p2 * c2) >> 8
-            err0 += np.abs(x[t] - pred)
-            p2, p1 = p1, np.broadcast_to(x[t], p1.shape)
-        delta = np.clip(err0 // (2 * max(1, min(spb, 6) - 2)), 16, 0x7FFF)  # int16 in header
+        n0 = min(spb, 6)
+        err0 = np.zeros(cand.shape, dtype=np.int64)
+        for t in range(2, n0):
+            err0 += np.abs(x[t] - ((x[t - 1] * c1 + x[t - 2] * c2) >> 8))
+        delta = np.clip(err0 // (2 * max(1, n0 - 2)), 16, 0x7FFF)  # int16 in the header
         delta0 = delta.copy()
-        nibbles = np.empty((spb - 2,) + s1.shape, dtype=np.uint8)
-        sse = np.zeros(s1.shape, dtype=np.float64)
+        nibbles = np.empty((spb - 2,) + cand.shape, dtype=np.uint8)
+        sse = np.zeros(cand.shape, dtype=np.int64)
         for t in range(2, spb):
             pred = (s1 * c1 + s2 * c2) >> 8
-            err = x[t] - pred
-            nib = np.clip(np.floor_divide(err + (delta >> 1), delta), -8, 7)
+            nib = np.clip(np.floor_divide(x[t] - pred + (delta >> 1), delta), -8, 7)
             new = np.clip(pred + nib * delta, -32768, 32767)
-            sse += (x[t] - new).astype(np.float64) ** 2
+            if best:
+                sse += (x[t] - new) ** 2
             nib &= 0xF
             delta = np.maximum(16, (adapt[nib] * delta) >> 8)
             nibbles[t - 2] = nib
             s2, s1 = s1, new
-        best = np.argmin(sse, axis=0)  # (B, ch)
-        bidx = np.arange(best.shape[0])[:, None]
-        cidx = np.arange(ch)[None, :]
-        nb = nibbles[:, best, bidx, cidx]            # (spb-2, B, ch)
-        nb = nb.transpose(1, 0, 2).reshape(nb.shape[1], -1)  # (B, (spb-2)*ch) time-major
+        pick = np.argmin(sse, axis=0) if best else np.zeros((nb_, nch), dtype=np.int64)
+        nb = nibbles[:, pick, bidx, cidx]                     # (spb-2, B, ch)
+        nb = nb.transpose(1, 0, 2).reshape(nb_, -1)           # time-major, channel-minor
         packed = ((nb[:, 0::2] << 4) | nb[:, 1::2]).astype(np.uint8)
         header = np.concatenate([
-            best.astype(np.uint8).view(np.uint8).reshape(-1, ch),
-            delta0[best, bidx, cidx].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
-            x[1].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
-            x[0].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
+            cand[pick, bidx, cidx].astype(np.uint8).reshape(-1, nch),
+            delta0[pick, bidx, cidx].astype("<i2").view(np.uint8).reshape(-1, 2 * nch),
+            x[1].astype("<i2").view(np.uint8).reshape(-1, 2 * nch),
+            x[0].astype("<i2").view(np.uint8).reshape(-1, 2 * nch),
         ], axis=1)
         out += np.concatenate([header, packed], axis=1).tobytes()
     return bytes(out), nblocks * spb
+
+
+def process_entry(job, decoder=None):
+    """Decode, byte-swap and/or compress one entry. Runs in worker processes,
+    so it only takes picklable data (`decoder` is for in-process use)."""
+    fmt = MiniFormat(*job["fmt"])
+    audio, duration = job["audio"], job["duration"]
+    loop_a, loop_b = job["loop"]
+    if job["decode"]:
+        if decoder is not None:
+            channels, rate, audio, loop = decoder(job["data"], job["index"])
+        else:
+            channels, rate, audio, loop = vgmstream_decode(job["exe"], job["src"], job["index"])
+        fmt = MiniFormat(TAG_PCM, channels, rate, channels * 2, 1)
+        duration = fmt.bytes_to_samples(len(audio))
+        loop_a, loop_b = (loop[0], loop[1] - loop[0]) if loop else (0, 0)
+    elif job["swap16"]:
+        audio = swap16(audio)
+    compressed = False
+    if job["adpcm"] and fmt.tag == TAG_PCM and fmt.bits:
+        audio, duration = encode_msadpcm(audio, fmt.channels, best=job["best"])
+        fmt = MiniFormat(TAG_ADPCM, fmt.channels, fmt.rate, ADPCM_ALIGN_FIELD, 0)
+        if loop_b:
+            # XAudio2 wants ADPCM loops on block boundaries
+            spb = ADPCM_SAMPLES_PER_BLOCK
+            start = loop_a // spb * spb
+            end = min(align_up(loop_a + loop_b, spb), duration)
+            loop_a, loop_b = start, end - start
+        compressed = True
+    return ((fmt.tag, fmt.channels, fmt.rate, fmt.block_align, fmt.bits), audio, duration,
+            (loop_a, loop_b), compressed)
 
 
 def notes(*items):
@@ -346,7 +405,7 @@ def align_up(value, alignment):
 
 
 def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None,
-            pc=False, decoder=None, vgmstream=None, adpcm=True):
+            pc=False, decoder=None, vgmstream=None, adpcm=True, best=False, executor=None):
     """Convert an XACT2 bank. `like` (a Reference) copies the target game's
     format: version numbers, byte order and whether entries are packed back
     to back. The bank's own name, streaming type and entries are kept.
@@ -354,7 +413,9 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
     from an Xbox 360 bank is then compressed to MS-ADPCM unless `adpcm` is
     False. `decoder` turns
     an entry into PCM16 (defaults to vgmstream-cli at `vgmstream` or found
-    automatically)."""
+    automatically). `executor` (e.g. a ProcessPoolExecutor) runs the
+    per-entry decoding/compression in parallel; `best` makes the ADPCM encoder
+    try every predictor."""
     if data[:4] == b"WBND":
         e = "<"
     elif data[:4] == b"DNBW":
@@ -466,6 +527,7 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
         if own_decoder:
             decoder = VgmstreamDecoder(vgmstream)
         try:
+            jobs = []
             for i in range(count):
                 eo = meta_off + i * meta_elem
                 flags_dur = r.u32(eo)
@@ -477,16 +539,9 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
                 loop_a, loop_b = r.u32(eo + 16), r.u32(eo + 20)
                 if play_off + play_len > len(wave_data):
                     raise ConvertError(f"entry {i}: play region outside wave data")
-                entry_flags = flags_dur & 0xF
                 duration = flags_dur >> 4
-
-                if decode:
-                    channels, rate, audio, loop = decoder(data, i)
-                    fmt = MiniFormat(TAG_PCM, channels, rate, channels * 2, 1)
-                    duration = fmt.bytes_to_samples(len(audio))
-                    loop_a, loop_b = (loop[0], loop[1] - loop[0]) if loop else (0, 0)
-                    decoded_any = True
-                else:
+                audio = b""
+                if not decode:
                     audio = wave_data[play_off:play_off + play_len]
                     if fmt.tag == TAG_PCM or (fmt.tag == TAG_ADPCM and duration == 0):
                         duration = fmt.bytes_to_samples(play_len)
@@ -495,34 +550,53 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
                         start = fmt.bytes_to_samples(loop_a)
                         end = fmt.bytes_to_samples(loop_a + loop_b)
                         loop_a, loop_b = start, end - start
-                    if swap and fmt.tag == TAG_PCM and fmt.bits:
-                        audio = swap16(audio)
-                if swap and adpcm and fmt.tag == TAG_PCM and fmt.bits:
-                    audio, duration = encode_msadpcm(audio, fmt.channels)
-                    fmt = MiniFormat(TAG_ADPCM, fmt.channels, fmt.rate, ADPCM_ALIGN_FIELD, 0)
-                    if loop_b:
-                        # XAudio2 wants ADPCM loops on block boundaries
-                        spb = ADPCM_SAMPLES_PER_BLOCK
-                        start = loop_a // spb * spb
-                        end = min(align_up(loop_a + loop_b, spb), duration)
-                        loop_a, loop_b = start, end - start
-                    compressed = True
+                decoded_any |= decode
+                jobs.append(dict(
+                    index=i, flags=flags_dur & 0xF, decode=decode, audio=audio,
+                    fmt=(fmt.tag, fmt.channels, fmt.rate, fmt.block_align, fmt.bits),
+                    duration=duration, loop=(loop_a, loop_b),
+                    swap16=swap and fmt.tag == TAG_PCM and fmt.bits == 1,
+                    adpcm=swap and adpcm, best=best))
+
+            for j in jobs:
+                j["heavy"] = bool(j["decode"] or j["adpcm"] or j["swap16"])
+            heavy = [j for j in jobs if j["heavy"]]
+            if decoded_any and own_decoder:
+                if not decoder.exe:
+                    raise ConvertError(MISSING_VGMSTREAM)
+                src = decoder.bank_path(data)
+                for j in heavy:
+                    j.update(exe=decoder.exe, src=src)
+            if executor is not None and own_decoder and len(heavy) > 1:
+                futures = [executor.submit(process_entry, j) for j in heavy]
+                results = {j["index"]: f for j, f in zip(heavy, futures)}
+                get = lambda j: results[j["index"]].result()  # noqa: E731
+            else:
+                for j in heavy:
+                    j["data"] = data
+                get = lambda j: process_entry(j, None if own_decoder else decoder)  # noqa: E731
+
+            for j in jobs:
+                i = j["index"]
+                if j["heavy"]:
+                    fmt_t, audio, duration, (loop_a, loop_b), compressed = get(j)
                 else:
-                    compressed = False
+                    fmt_t, audio, duration, (loop_a, loop_b), compressed = (
+                        j["fmt"], j["audio"], j["duration"], j["loop"], False)
+                fmt = MiniFormat(*fmt_t)
                 if duration > 0x0FFFFFFF:
                     raise ConvertError(f"entry {i}: duration too long for XACT3")
-
                 if like is not None and like.tags and fmt.tag not in like.tags:
                     log(f"warning: entry {i} is {TAG_NAMES[fmt.tag]} but the reference uses "
                         + "/".join(TAG_NAMES[t] for t in sorted(like.tags)))
                 new_off = align_up(len(new_wave), entry_align)
                 new_wave += b"\0" * (new_off - len(new_wave))
                 new_wave += audio
-                new_meta += struct.pack(out_e + "6I", entry_flags | duration << 4, fmt.pack(),
+                new_meta += struct.pack(out_e + "6I", j["flags"] | duration << 4, fmt.pack(),
                                         new_off, len(audio), loop_a, loop_b)
                 log(f"  #{i}: {TAG_NAMES[fmt.tag]} {fmt.channels}ch {fmt.rate}Hz, "
                     f"{duration} samples" + (f", loop {loop_a}+{loop_b}" if loop_b else "")
-                    + notes(decode and "decoded", compressed and "compressed to ADPCM"))
+                    + notes(j["decode"] and "decoded", compressed and "compressed to ADPCM"))
         finally:
             if own_decoder:
                 decoder.close()
@@ -581,11 +655,29 @@ def read_version(path):
     return struct.unpack(("<" if head[:4] == b"WBND" else ">") + "I", head[4:])[0]
 
 
+def expand_inputs(paths):
+    """Yield (file, output_dir) pairs. Folders are searched recursively for .xwb
+    files, whose output mirrors the folder layout under <folder>/converted."""
+    for path in paths:
+        if not os.path.isdir(path):
+            yield path, os.path.join(os.path.dirname(path), "converted")
+            continue
+        root = os.path.abspath(path)
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d.lower() != "converted")
+            for name in sorted(files):
+                if name.lower().endswith(".xwb"):
+                    rel = os.path.relpath(folder, root)
+                    yield (os.path.join(folder, name),
+                           os.path.normpath(os.path.join(root, "converted", rel)))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Convert XACT 2.x .xwb wave banks to XACT 3. If one of the inputs is "
+        description="Convert XACT 2.x .xwb wave banks to XACT 3. If one of the given files is "
                     "already an XACT3 bank (e.g. the game's original), it is used as --like.")
-    ap.add_argument("input", nargs="+", help="XACT2 .xwb file(s)")
+    ap.add_argument("input", nargs="+",
+                    help="XACT2 .xwb files and/or folders (searched recursively)")
     ap.add_argument("-o", "--output",
                     help="output file (single input) or directory; default: a 'converted' "
                          "folder next to each input, keeping the file name")
@@ -601,6 +693,10 @@ def main(argv=None):
     ap.add_argument("--pcm", action="store_true",
                     help="with --pc: keep Xbox 360 audio as uncompressed 16-bit PCM instead of "
                          "compressing it to MS-ADPCM (bigger files, lossless)")
+    ap.add_argument("--best", action="store_true",
+                    help="slower ADPCM encoding that tries every predictor (marginally better)")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                    help="CPU cores to use for decoding/compressing (default: all)")
     ap.add_argument("--vgmstream", metavar="PATH",
                     help="vgmstream-cli executable used to decode XMA (default: next to this "
                          "script or on PATH)")
@@ -610,12 +706,12 @@ def main(argv=None):
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
-    log = (lambda m: None) if args.quiet else (lambda m: print(m, file=sys.stderr))
-    inputs = list(args.input)
+    say = (lambda m: None) if args.quiet else (lambda m: print(m, file=sys.stderr, flush=True))
     like_path = args.like
+    explicit = [p for p in args.input if not os.path.isdir(p)]
     if like_path is None:
         refs = []
-        for path in inputs:
+        for path in explicit:
             try:
                 version = read_version(path)
             except OSError:
@@ -626,9 +722,8 @@ def main(argv=None):
             print("error: more than one XACT3 bank given; only one reference bank is allowed",
                   file=sys.stderr)
             return 1
-        if refs and len(inputs) > 1:
+        if refs and len(args.input) > 1:
             like_path = refs[0]
-            inputs.remove(like_path)
     like = TECHLAND if args.techland else None
     if like_path:
         try:
@@ -638,33 +733,79 @@ def main(argv=None):
             print(f"{like_path}: error: {exc}", file=sys.stderr)
             return 1
     if like:
-        log(f"target format: content version {like.tool_version}, "
+        say(f"target format: content version {like.tool_version}, "
             f"{'packed' if like.packed else 'aligned'} data"
             + (f" (from {like_path})" if like_path else " (Techland preset)"))
 
-    failures = 0
-    for path in inputs:
-        if args.output and len(inputs) == 1 and not os.path.isdir(args.output):
+    tasks = []
+    for path, out_dir in expand_inputs([p for p in args.input if p != like_path]):
+        try:
+            version = read_version(path)
+        except OSError:
+            version = None
+        if version is not None and is_xact3(version):
+            say(f"{path}: skipped, already XACT3")
+            continue
+        if args.output and len(args.input) == 1 and os.path.isfile(args.input[0]) \
+                and not os.path.isdir(args.output):
             out = args.output
         else:
-            out_dir = args.output or os.path.join(os.path.dirname(path), "converted")
-            os.makedirs(out_dir, exist_ok=True)
-            out = os.path.join(out_dir, os.path.basename(path))
-        if os.path.exists(out) and any(os.path.samefile(out, p)
-                                       for p in [path] + ([like_path] if like_path else [])):
-            print(f"{path}: error: refusing to overwrite {out}", file=sys.stderr)
-            failures += 1
-            continue
+            out = os.path.join(args.output or out_dir, os.path.basename(path))
+        tasks.append((path, out))
+    if not tasks:
+        print("error: no .xwb files to convert", file=sys.stderr)
+        return 1
+
+    def run(task, executor):
+        path, out = task
+        lines = []
+        log = lines.append
         try:
+            if os.path.exists(out) and any(os.path.samefile(out, p)
+                                           for p in [path] + ([like_path] if like_path else [])):
+                raise ConvertError(f"refusing to overwrite {out}")
             with open(path, "rb") as f:
                 result = convert(f.read(), args.tool_version, log, like, pc=args.pc,
-                                 vgmstream=args.vgmstream, adpcm=not args.pcm)
+                                 vgmstream=args.vgmstream, adpcm=not args.pcm,
+                                 best=args.best, executor=executor)
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             with open(out, "wb") as f:
                 f.write(result)
-            log(f"{path} -> {out}")
+            lines.append(f"{path} -> {out}")
+            return True, lines
         except (ConvertError, OSError) as exc:
-            print(f"{path}: error: {exc}", file=sys.stderr)
-            failures += 1
+            lines.append(f"{path}: error: {exc}")
+            return False, lines
+
+    failures = 0
+    jobs = max(1, args.jobs)
+    if len(tasks) > 1:
+        say(f"converting {len(tasks)} banks using {jobs} CPU core(s)")
+    if jobs == 1:
+        results = (run(t, None) for t in tasks)
+        pool = files = None
+    else:
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+        pool = ProcessPoolExecutor(max_workers=jobs)
+        # a few banks at a time: their entries share the worker processes
+        files = ThreadPoolExecutor(max_workers=min(jobs, len(tasks), 4))
+        results = files.map(lambda t: run(t, pool), tasks)
+    try:
+        for n, (ok, lines) in enumerate(results, 1):
+            failures += not ok
+            for line in lines:
+                if ok:
+                    say(line)
+                else:
+                    print(line, file=sys.stderr, flush=True)
+            if len(tasks) > 1:
+                say(f"[{n}/{len(tasks)}] done")
+    finally:
+        if files:
+            files.shutdown()
+            pool.shutdown()
+    if len(tasks) > 1:
+        say(f"{len(tasks) - failures} converted, {failures} failed")
     return 1 if failures else 0
 
 

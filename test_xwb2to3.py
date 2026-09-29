@@ -410,6 +410,60 @@ class ConvertTests(unittest.TestCase):
         # loop 200..700 widened to block boundaries 128..768
         self.assertEqual(ent["loop"], (128, 640))
 
+    def test_cli_folder_parallel_matches_serial(self):
+        import tempfile
+        fmt = old_fmt(x.TAG_PCM, 1, 22050, 0, 1, 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "radio", "sub"))
+            for rel, audio in (("a.xwb", b"\x01\x02" * 300), ("sub/b.xwb", b"\x03\x04" * 500)):
+                with open(os.path.join(tmp, "radio", rel), "wb") as f:
+                    f.write(build_xact2(40, [(0, fmt, audio, 0, 0), (0, fmt, audio, 0, 0)],
+                                        e=">"))
+            reference = self._reference()
+            with open(os.path.join(tmp, "radio", "game.xwb"), "wb") as f:
+                f.write(reference)  # XACT3 banks inside folders are skipped
+            outputs = []
+            for jobs in ("1", "2"):
+                self.assertEqual(x.main(["-q", "--techland", "--pcm", "-j", jobs,
+                                         os.path.join(tmp, "radio")]), 0)
+                conv = os.path.join(tmp, "radio", "converted")
+                self.assertEqual(sorted(os.listdir(conv)), ["a.xwb", "sub"])
+                self.assertEqual(os.listdir(os.path.join(conv, "sub")), ["b.xwb"])
+                outputs.append([open(os.path.join(conv, r), "rb").read()
+                                for r in ("a.xwb", "sub/b.xwb")])
+                os.rename(conv, os.path.join(tmp, f"run{jobs}"))
+            self.assertEqual(outputs[0], outputs[1])
+            out = parse_xact3(outputs[0][1], packed=True)
+            self.assertEqual(out["entries"][0]["audio"], b"\x04\x03" * 500)
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy not installed")
+    def test_parallel_adpcm_matches_serial(self):
+        from concurrent.futures import ProcessPoolExecutor
+        import math
+        fmt = old_fmt(x.TAG_PCM, 2, 44100, 0, 1, 40)
+        ents = [(0, fmt, b"".join(struct.pack(">hh", int(5000 * math.sin(i / (3 + k))),
+                                              int(4000 * math.cos(i / (4 + k))))
+                                  for i in range(3000)), 100, 900) for k in range(3)]
+        src = build_xact2(40, ents, e=">")
+        serial = x.convert(src, like=x.TECHLAND)
+        with ProcessPoolExecutor(max_workers=2) as pool:
+            parallel = x.convert(src, like=x.TECHLAND, executor=pool)
+        self.assertEqual(serial, parallel)
+
+    def test_best_encoder_is_no_worse(self):
+        if not HAVE_NUMPY:
+            self.skipTest("numpy not installed")
+        import math
+        pcm = b"".join(struct.pack("<h", int(9000 * math.sin(i / 3) + 3000 * math.sin(i / 1.3)))
+                       for i in range(4000))
+        errs = []
+        for best in (False, True):
+            data, total = x.encode_msadpcm(pcm, 1, best=best)
+            dec = self.decode_msadpcm(data, 1, 70)
+            orig = struct.unpack("<4000h", pcm)
+            errs.append(sum((a - b[0]) ** 2 for a, b in zip(orig, dec)))
+        self.assertLessEqual(errs[1], errs[0])
+
     def test_rejects_xma1_and_xact3(self):
         fmt = old_fmt(x.TAG_XMA, 2, 44100, 0, 0, 37)
         src = build_xact2(37, [(0, fmt, b"\0" * 2048, 0, 0)])
