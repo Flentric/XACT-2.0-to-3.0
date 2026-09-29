@@ -1,5 +1,6 @@
 """Tests for xwb2to3: build synthetic XACT2 banks, convert, re-parse as XACT3."""
 
+import os
 import struct
 import unittest
 
@@ -277,6 +278,64 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(out["version"], 0x10000)
         self.assertEqual(out["name"], b"TestBank")
         self.assertEqual([en["audio"] for en in out["entries"]], [b"\0\1" * 3, b"\2\3" * 3])
+
+    def test_x360_pcm16_to_pc_is_byteswapped(self):
+        audio_be = struct.pack(">4h", 1, -2, 300, -400)
+        fmt = old_fmt(x.TAG_PCM, 2, 44100, 0, 1, 40)
+        src = build_xact2(40, [(0, fmt, audio_be, 0, 0)], e=">", names=[b"song"])
+        out_bytes = x.convert(src, like=x.TECHLAND)
+        self.assertEqual(out_bytes[:4], b"WBND")
+        out = parse_xact3(out_bytes, packed=True)
+        self.assertEqual(out["version"], 0x10000)
+        self.assertEqual(out["names"], [b"song"])
+        ent = out["entries"][0]
+        self.assertEqual(ent["audio"], struct.pack("<4h", 1, -2, 300, -400))
+        self.assertEqual((ent["fmt"].channels, ent["fmt"].rate, ent["duration"]), (2, 44100, 2))
+
+    def test_x360_xma_is_decoded_for_pc(self):
+        calls = []
+        pcm = struct.pack("<6h", 1, 2, 3, 4, 5, 6)
+
+        def fake_decoder(data, index):
+            calls.append(index)
+            return 2, 48000, pcm, (1, 3) if index == 0 else None
+
+        for version in (37, 40):  # XMA1 and XMA2
+            calls.clear()
+            fmt = old_fmt(x.TAG_XMA, 2, 48000, 0, 0, version)
+            src = build_xact2(version, [(0, fmt, b"\xaa" * 2048, 0, 0),
+                                        (0, fmt, b"\xbb" * 2048, 0, 0)], e=">")
+            out = parse_xact3(x.convert(src, pc=True, decoder=fake_decoder))
+            self.assertEqual(calls, [0, 1])
+            a, b = out["entries"]
+            self.assertEqual((a["fmt"].tag, a["fmt"].channels, a["fmt"].block_align),
+                             (x.TAG_PCM, 2, 4))
+            self.assertEqual(a["audio"], pcm)
+            self.assertEqual(a["duration"], 3)
+            self.assertEqual(a["loop"], (1, 2))
+            self.assertEqual(b["loop"], (0, 0))
+            self.assertFalse(out["flags"] & x.FLAGS_SEEKTABLES)
+
+    def test_x360_bank_without_pc_target_keeps_byte_order(self):
+        fmt = old_fmt(x.TAG_PCM, 1, 44100, 0, 1, 40)
+        src = build_xact2(40, [(0, fmt, b"\x00\x01", 0, 0)], e=">")
+        out_bytes = x.convert(src)
+        self.assertEqual(out_bytes[:4], b"DNBW")
+        self.assertEqual(parse_xact3(out_bytes)["entries"][0]["audio"], b"\x00\x01")
+
+    @unittest.skipUnless(os.environ.get("VGMSTREAM") or x.find_vgmstream(),
+                         "vgmstream-cli not available")
+    def test_vgmstream_decoder_matches_byteswap(self):
+        audio_be = b"".join(struct.pack(">h", (i * 37) % 3000 - 1500) for i in range(2000))
+        fmt = old_fmt(x.TAG_PCM, 2, 44100, 0, 1, 40)
+        src = build_xact2(40, [(0, fmt, audio_be, 0, 0)], e=">")
+        dec = x.VgmstreamDecoder(os.environ.get("VGMSTREAM"))
+        try:
+            channels, rate, pcm, loop = dec(src, 0)
+        finally:
+            dec.close()
+        self.assertEqual((channels, rate, loop), (2, 44100, None))
+        self.assertEqual(pcm, x.swap16(audio_be))
 
     def test_rejects_xma1_and_xact3(self):
         fmt = old_fmt(x.TAG_XMA, 2, 44100, 0, 0, 37)
