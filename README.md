@@ -2,7 +2,7 @@
 
 `xwb2to3.py` converts XACT 2.x wave banks (`.xwb`) to the XACT 3 format. XACT 3 banks (tool version 46, header version 44) are what XNA 3.x/4.0, MonoGame, FNA and DirectXTK load.
 
-Requires only Python 3.8+. There are no other dependencies.
+Requires Python 3.8+. Converting Xbox 360 banks for PC also uses [vgmstream](https://vgmstream.org) (to decode XMA) and numpy (to compress to ADPCM, installed with `py -m pip install numpy`).
 
 ## Usage
 
@@ -14,9 +14,12 @@ Requires only Python 3.8+. There are no other dependencies.
 
 - rewrites the bank in little-endian (PC) byte order,
 - byte-swaps 16-bit PCM audio,
-- decodes XMA audio to 16-bit PCM with [vgmstream](https://vgmstream.org).
+- decodes XMA audio to 16-bit PCM with [vgmstream](https://vgmstream.org),
+- compresses the audio to MS-ADPCM, the format Dead Island's own banks use. This is about 4× smaller than PCM.
 
-For the XMA step, download the vgmstream **command-line** build for Windows. Put `vgmstream-cli.exe` and its DLLs next to `xwb2to3.py`, or in a `vgmstream` subfolder. Decoded banks are larger than the originals, because PCM is uncompressed.
+For the XMA step, download the vgmstream **Command-line (64-bit)** build for Windows. Put `vgmstream-cli.exe` and its DLLs next to `xwb2to3.py`, or in a `vgmstream` subfolder.
+
+ADPCM compression needs numpy. Install it once with `py -m pip install numpy`. Without it, the audio stays as uncompressed PCM, which plays but is about 4× bigger. Pass `--pcm` to keep PCM on purpose.
 
 **Other games with a non-standard format:** drag any `.xwb` from the game onto `convert.bat` together with your banks. The converter spots that the game's file is already XACT3 and copies only its format: the version numbers and how the data is packed. Your banks keep their own names, streaming type and sounds.
 
@@ -47,10 +50,11 @@ It supports XACT2 content versions 4–41, in little-endian (PC) and big-endian 
 
 | Codec | Same platform | Xbox 360 → PC |
 | --- | --- | --- |
-| PCM 8/16-bit | yes | yes, byte-swapped |
-| MS-ADPCM | yes | decoded to PCM with vgmstream |
-| XMA2 (content 39–41) | copied as is | decoded to PCM with vgmstream |
-| XMA1 (Xbox 360, content ≤ 38) | no | decoded to PCM with vgmstream |
+| PCM 8-bit | yes | yes |
+| PCM 16-bit | yes | byte-swapped, then compressed to ADPCM |
+| MS-ADPCM | yes | decoded with vgmstream, then compressed to ADPCM |
+| XMA2 (content 39–41) | copied as is | decoded with vgmstream, then compressed to ADPCM |
+| XMA1 (Xbox 360, content ≤ 38) | no | decoded with vgmstream, then compressed to ADPCM |
 | Compact banks | yes, if alignment is already valid | not yet |
 
 ## Tests

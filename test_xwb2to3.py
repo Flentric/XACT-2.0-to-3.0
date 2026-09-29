@@ -6,6 +6,12 @@ import unittest
 
 import xwb2to3 as x
 
+try:
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
 
 def old_fmt(tag, ch, rate, align, bits, version):
     if version <= x.XACT2_2_MAX:
@@ -283,7 +289,7 @@ class ConvertTests(unittest.TestCase):
         audio_be = struct.pack(">4h", 1, -2, 300, -400)
         fmt = old_fmt(x.TAG_PCM, 2, 44100, 0, 1, 40)
         src = build_xact2(40, [(0, fmt, audio_be, 0, 0)], e=">", names=[b"song"])
-        out_bytes = x.convert(src, like=x.TECHLAND)
+        out_bytes = x.convert(src, like=x.TECHLAND, adpcm=False)
         self.assertEqual(out_bytes[:4], b"WBND")
         out = parse_xact3(out_bytes, packed=True)
         self.assertEqual(out["version"], 0x10000)
@@ -305,7 +311,7 @@ class ConvertTests(unittest.TestCase):
             fmt = old_fmt(x.TAG_XMA, 2, 48000, 0, 0, version)
             src = build_xact2(version, [(0, fmt, b"\xaa" * 2048, 0, 0),
                                         (0, fmt, b"\xbb" * 2048, 0, 0)], e=">")
-            out = parse_xact3(x.convert(src, pc=True, decoder=fake_decoder))
+            out = parse_xact3(x.convert(src, pc=True, decoder=fake_decoder, adpcm=False))
             self.assertEqual(calls, [0, 1])
             a, b = out["entries"]
             self.assertEqual((a["fmt"].tag, a["fmt"].channels, a["fmt"].block_align),
@@ -336,6 +342,73 @@ class ConvertTests(unittest.TestCase):
             dec.close()
         self.assertEqual((channels, rate, loop), (2, 44100, None))
         self.assertEqual(pcm, x.swap16(audio_be))
+
+    @staticmethod
+    def decode_msadpcm(data, channels, block_bytes):
+        """Reference MS-ADPCM decoder (as in vgmstream) for checking the encoder."""
+        out = []
+        for b in range(0, len(data), block_bytes):
+            blk = data[b:b + block_bytes]
+            ch = channels
+            pred = list(blk[:ch])
+            delta = list(struct.unpack_from(f"<{ch}h", blk, ch))
+            s1 = list(struct.unpack_from(f"<{ch}h", blk, 3 * ch))
+            s2 = list(struct.unpack_from(f"<{ch}h", blk, 5 * ch))
+            frames = [tuple(s2), tuple(s1)]
+            nibs = []
+            for byte in blk[7 * ch:]:
+                nibs += [byte >> 4, byte & 0xF]
+            for t in range(0, len(nibs), ch):
+                frame = []
+                for c in range(ch):
+                    n = nibs[t + c]
+                    c1, c2 = x.ADPCM_COEFS[pred[c]]
+                    p = (s1[c] * c1 + s2[c] * c2) >> 8
+                    v = max(-32768, min(32767, p + (n - 16 if n & 8 else n) * delta[c]))
+                    delta[c] = max(16, (x.ADPCM_ADAPT[n] * delta[c]) >> 8)
+                    s2[c], s1[c] = s1[c], v
+                    frame.append(v)
+                frames.append(tuple(frame))
+            out += frames
+        return out
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy not installed")
+    def test_msadpcm_encoder_quality(self):
+        import math
+        for ch in (1, 2):
+            n = 1000  # not a multiple of the block size
+            frames = [tuple(int(10000 * math.sin(i / (7 + c)) + 2000 * math.sin(i / 1.7))
+                            for c in range(ch)) for i in range(n)]
+            pcm = b"".join(struct.pack(f"<{ch}h", *f) for f in frames)
+            data, total = x.encode_msadpcm(pcm, ch)
+            block = (x.ADPCM_ALIGN_FIELD + 22) * ch
+            self.assertEqual(len(data) % block, 0)
+            self.assertEqual(total, len(data) // block * x.ADPCM_SAMPLES_PER_BLOCK)
+            self.assertGreaterEqual(total, n)
+            dec = self.decode_msadpcm(data, ch, block)
+            self.assertEqual(len(dec), total)
+            sig = sum(v * v for f in frames for v in f)
+            err = sum((a - b) ** 2 for f, g in zip(frames, dec) for a, b in zip(f, g))
+            self.assertGreater(10 * math.log10(sig / err), 30)  # ADPCM-level quality
+            self.assertEqual(dec[0], frames[0])  # header samples are exact
+            self.assertEqual(dec[1], frames[1])
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy not installed")
+    def test_x360_to_pc_compresses_to_adpcm(self):
+        import math
+        n = 1000
+        audio_be = b"".join(struct.pack(">h", int(8000 * math.sin(i / 5))) for i in range(n))
+        fmt = old_fmt(x.TAG_PCM, 1, 44100, 0, 1, 40)
+        src = build_xact2(40, [(0, fmt, audio_be, 200, 500)], e=">")
+        out = parse_xact3(x.convert(src, like=x.TECHLAND), packed=True)
+        ent = out["entries"][0]
+        self.assertEqual((ent["fmt"].tag, ent["fmt"].channels, ent["fmt"].rate,
+                          ent["fmt"].block_align), (x.TAG_ADPCM, 1, 44100, x.ADPCM_ALIGN_FIELD))
+        spb = x.ADPCM_SAMPLES_PER_BLOCK
+        self.assertEqual(ent["duration"], 8 * spb)
+        self.assertEqual(len(ent["audio"]), 8 * 70)
+        # loop 200..700 widened to block boundaries 128..768
+        self.assertEqual(ent["loop"], (128, 640))
 
     def test_rejects_xma1_and_xact3(self):
         fmt = old_fmt(x.TAG_XMA, 2, 44100, 0, 0, 37)

@@ -254,6 +254,79 @@ class VgmstreamDecoder:
             self.tmp = None
 
 
+ADPCM_COEFS = ((256, 0), (512, -256), (0, 0), (192, 64), (240, 0), (460, -208), (392, -232))
+ADPCM_ADAPT = (230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230)
+ADPCM_ALIGN_FIELD = 48  # 70 bytes per channel = 128 samples per block, as XACT and Dead Island use
+ADPCM_SAMPLES_PER_BLOCK = (ADPCM_ALIGN_FIELD + ADPCM_BLOCKALIGN_CONVERSION_OFFSET) * 2 - 12
+
+
+def encode_msadpcm(pcm, channels, align_field=ADPCM_ALIGN_FIELD, chunk_blocks=8192):
+    """Encode 16-bit little-endian PCM to MS-ADPCM as XACT stores it.
+
+    Blocks are independent, so all blocks (and all 7 predictors, keeping the
+    best per block and channel) are encoded in parallel with numpy.
+    Returns (adpcm_bytes, padded_sample_count)."""
+    import numpy as np
+
+    ch = channels
+    block_bytes = (align_field + ADPCM_BLOCKALIGN_CONVERSION_OFFSET) * ch
+    spb = block_bytes * 2 // ch - 12
+    samples = np.frombuffer(pcm[:len(pcm) // (2 * ch) * 2 * ch], dtype="<i2").reshape(-1, ch)
+    nblocks = max(1, -(-len(samples) // spb))
+    padded = np.zeros((nblocks * spb, ch), dtype=np.int32)
+    padded[:len(samples)] = samples
+    blocks = padded.reshape(nblocks, spb, ch)
+
+    c1 = np.array([c[0] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
+    c2 = np.array([c[1] for c in ADPCM_COEFS], dtype=np.int64)[:, None, None]
+    adapt = np.array(ADPCM_ADAPT, dtype=np.int64)
+    out = bytearray()
+    for b0 in range(0, nblocks, chunk_blocks):
+        x = blocks[b0:b0 + chunk_blocks].transpose(1, 0, 2).astype(np.int64)  # (spb, B, ch)
+        s2 = np.broadcast_to(x[0], (7,) + x[0].shape).copy()
+        s1 = np.broadcast_to(x[1], (7,) + x[1].shape).copy()
+        # initial step size from the prediction error of the first few samples
+        err0 = np.zeros_like(s1)
+        p2, p1 = s2.copy(), s1.copy()
+        for t in range(2, min(spb, 6)):
+            pred = (p1 * c1 + p2 * c2) >> 8
+            err0 += np.abs(x[t] - pred)
+            p2, p1 = p1, np.broadcast_to(x[t], p1.shape)
+        delta = np.clip(err0 // (2 * max(1, min(spb, 6) - 2)), 16, 0x7FFF)  # int16 in header
+        delta0 = delta.copy()
+        nibbles = np.empty((spb - 2,) + s1.shape, dtype=np.uint8)
+        sse = np.zeros(s1.shape, dtype=np.float64)
+        for t in range(2, spb):
+            pred = (s1 * c1 + s2 * c2) >> 8
+            err = x[t] - pred
+            nib = np.clip(np.floor_divide(err + (delta >> 1), delta), -8, 7)
+            new = np.clip(pred + nib * delta, -32768, 32767)
+            sse += (x[t] - new).astype(np.float64) ** 2
+            nib &= 0xF
+            delta = np.maximum(16, (adapt[nib] * delta) >> 8)
+            nibbles[t - 2] = nib
+            s2, s1 = s1, new
+        best = np.argmin(sse, axis=0)  # (B, ch)
+        bidx = np.arange(best.shape[0])[:, None]
+        cidx = np.arange(ch)[None, :]
+        nb = nibbles[:, best, bidx, cidx]            # (spb-2, B, ch)
+        nb = nb.transpose(1, 0, 2).reshape(nb.shape[1], -1)  # (B, (spb-2)*ch) time-major
+        packed = ((nb[:, 0::2] << 4) | nb[:, 1::2]).astype(np.uint8)
+        header = np.concatenate([
+            best.astype(np.uint8).view(np.uint8).reshape(-1, ch),
+            delta0[best, bidx, cidx].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
+            x[1].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
+            x[0].astype("<i2").view(np.uint8).reshape(-1, 2 * ch),
+        ], axis=1)
+        out += np.concatenate([header, packed], axis=1).tobytes()
+    return bytes(out), nblocks * spb
+
+
+def notes(*items):
+    items = [i for i in items if i]
+    return f" ({', '.join(items)})" if items else ""
+
+
 def swap32_all(blob):
     words = array.array("I")
     words.frombytes(blob[:len(blob) // 4 * 4])
@@ -273,11 +346,13 @@ def align_up(value, alignment):
 
 
 def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=None,
-            pc=False, decoder=None, vgmstream=None):
+            pc=False, decoder=None, vgmstream=None, adpcm=True):
     """Convert an XACT2 bank. `like` (a Reference) copies the target game's
     format: version numbers, byte order and whether entries are packed back
     to back. The bank's own name, streaming type and entries are kept.
-    `pc` forces a little-endian bank with PC-playable audio; `decoder` turns
+    `pc` forces a little-endian bank with PC-playable audio; audio converted
+    from an Xbox 360 bank is then compressed to MS-ADPCM unless `adpcm` is
+    False. `decoder` turns
     an entry into PCM16 (defaults to vgmstream-cli at `vgmstream` or found
     automatically)."""
     if data[:4] == b"WBND":
@@ -353,6 +428,13 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
         log("converting Xbox 360 (big-endian) bank to PC (little-endian)")
         if compact:
             raise ConvertError("compact Xbox 360 banks cannot be converted for PC yet")
+        if adpcm:
+            try:
+                import numpy  # noqa: F401
+            except ImportError:
+                log("warning: numpy is not installed, so audio is left as uncompressed PCM. "
+                    "Run 'py -m pip install numpy' to enable ADPCM compression")
+                adpcm = False
 
     min_align = DVD_SECTOR_SIZE if streaming else 4
     wave_data = r.blob(*wave)
@@ -415,6 +497,18 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
                         loop_a, loop_b = start, end - start
                     if swap and fmt.tag == TAG_PCM and fmt.bits:
                         audio = swap16(audio)
+                if swap and adpcm and fmt.tag == TAG_PCM and fmt.bits:
+                    audio, duration = encode_msadpcm(audio, fmt.channels)
+                    fmt = MiniFormat(TAG_ADPCM, fmt.channels, fmt.rate, ADPCM_ALIGN_FIELD, 0)
+                    if loop_b:
+                        # XAudio2 wants ADPCM loops on block boundaries
+                        spb = ADPCM_SAMPLES_PER_BLOCK
+                        start = loop_a // spb * spb
+                        end = min(align_up(loop_a + loop_b, spb), duration)
+                        loop_a, loop_b = start, end - start
+                    compressed = True
+                else:
+                    compressed = False
                 if duration > 0x0FFFFFFF:
                     raise ConvertError(f"entry {i}: duration too long for XACT3")
 
@@ -428,7 +522,7 @@ def convert(data, tool_version=XACT3_TOOL_VERSION, log=lambda msg: None, like=No
                                         new_off, len(audio), loop_a, loop_b)
                 log(f"  #{i}: {TAG_NAMES[fmt.tag]} {fmt.channels}ch {fmt.rate}Hz, "
                     f"{duration} samples" + (f", loop {loop_a}+{loop_b}" if loop_b else "")
-                    + (" (decoded to PCM)" if decode else ""))
+                    + notes(decode and "decoded", compressed and "compressed to ADPCM"))
         finally:
             if own_decoder:
                 decoder.close()
@@ -504,6 +598,9 @@ def main(argv=None):
     ap.add_argument("--pc", action="store_true",
                     help="make the bank playable on PC: little-endian, XMA decoded to PCM "
                          "(implied by --techland and by a PC --like bank)")
+    ap.add_argument("--pcm", action="store_true",
+                    help="with --pc: keep Xbox 360 audio as uncompressed 16-bit PCM instead of "
+                         "compressing it to MS-ADPCM (bigger files, lossless)")
     ap.add_argument("--vgmstream", metavar="PATH",
                     help="vgmstream-cli executable used to decode XMA (default: next to this "
                          "script or on PATH)")
@@ -561,7 +658,7 @@ def main(argv=None):
         try:
             with open(path, "rb") as f:
                 result = convert(f.read(), args.tool_version, log, like, pc=args.pc,
-                                 vgmstream=args.vgmstream)
+                                 vgmstream=args.vgmstream, adpcm=not args.pcm)
             with open(out, "wb") as f:
                 f.write(result)
             log(f"{path} -> {out}")
